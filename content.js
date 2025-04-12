@@ -246,15 +246,13 @@ async function activatePictureInPicture(video) {
     
     // Add event listener for when PiP is closed
     video.addEventListener('leavepictureinpicture', () => {
-      // If the document is still hidden, try to find another video to put in PiP
+      // Only look for another video if document is still hidden
       if (document.hidden && lastKnownPlayingVideos.length > 0) {
         // Find the next best video that isn't this one
         const nextVideo = lastKnownPlayingVideos.find(v => v !== video);
         if (nextVideo) {
           activatePictureInPicture(nextVideo);
         }
-      } else {
-        pipVideo = null;
       }
     }, { once: true });
   } catch (error) {
@@ -277,6 +275,12 @@ function handleVisibilityChange() {
       // If our primary reference isn't playing, use the first playing video
       activatePictureInPicture(lastKnownPlayingVideos[0]);
     }
+  } 
+  // When tab becomes visible again and there's a PiP video
+  else if (document.pictureInPictureElement) {
+    // Exit PiP mode when returning to the original tab
+    document.exitPictureInPicture()
+      .catch(error => console.log('Error exiting PiP:', error));
   }
 }
 
