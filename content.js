@@ -1,6 +1,7 @@
 // Global variables
 let pipVideo = null;
 let observer = null;
+let lastKnownPlayingVideos = [];
 let settings = {
   autoPipEnabled: true,
   siteList: [],
@@ -64,14 +65,30 @@ function init() {
   });
   
   // Listen for messages from background script
-  chrome.runtime.onMessage.addListener((request) => {
+  chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     if (request.action === 'toggle-pip') {
       togglePictureInPicture();
+      sendResponse({success: true});
     }
+    return true;
   });
   
   // Handle page visibility changes
   document.addEventListener('visibilitychange', handleVisibilityChange);
+  
+  // Listen for tab blur events - more reliable than visibilitychange on some browsers
+  window.addEventListener('blur', () => {
+    // Short timeout to make sure the visibility state has changed
+    setTimeout(handleVisibilityChange, 100);
+  });
+  
+  // Additional listener for when the tab loses focus
+  window.addEventListener('beforeunload', () => {
+    // Try to activate PiP before the page unloads
+    if (pipVideo && !document.pictureInPictureElement) {
+      activatePictureInPicture(pipVideo);
+    }
+  });
 }
 
 // Set up mutation observer to detect video elements
@@ -81,17 +98,28 @@ function setupVideoObserver() {
   
   // Then, observe for new videos being added
   observer = new MutationObserver((mutations) => {
+    let videosFound = false;
+    
     for (const mutation of mutations) {
       if (mutation.type === 'childList') {
         for (const node of mutation.addedNodes) {
           if (node.nodeName === 'VIDEO') {
             handleVideoElement(node);
+            videosFound = true;
           } else if (node.querySelectorAll) {
             const videos = node.querySelectorAll('video');
-            videos.forEach(handleVideoElement);
+            if (videos.length > 0) {
+              videos.forEach(handleVideoElement);
+              videosFound = true;
+            }
           }
         }
       }
+    }
+    
+    // If we found new videos, update our tracking
+    if (videosFound) {
+      updatePlayingVideosList();
     }
     
     // Also check iframes periodically, as they might load after the page
@@ -100,8 +128,33 @@ function setupVideoObserver() {
   
   observer.observe(document.body, {
     childList: true,
-    subtree: true
+    subtree: true,
+    attributes: true, 
+    attributeFilter: ['src', 'style', 'class']
   });
+}
+
+// Track all playing videos on the page
+function updatePlayingVideosList() {
+  const allVideos = document.querySelectorAll('video');
+  
+  lastKnownPlayingVideos = Array.from(allVideos).filter(video => 
+    !video.paused && 
+    !video.ended && 
+    video.currentTime > 0 &&
+    video.readyState > 2 &&
+    video.offsetWidth > 100 && 
+    video.offsetHeight > 100
+  ).sort((a, b) => {
+    // Sort by size (largest first)
+    return (b.offsetWidth * b.offsetHeight) - (a.offsetWidth * a.offsetHeight);
+  });
+  
+  // Update our primary video reference if we have playing videos
+  if (lastKnownPlayingVideos.length > 0 && 
+     (!pipVideo || pipVideo.paused || pipVideo.ended)) {
+    pipVideo = lastKnownPlayingVideos[0];
+  }
 }
 
 // Check for existing video elements
@@ -116,8 +169,11 @@ function checkExistingVideos() {
       return bArea - aArea; // Sort from largest to smallest
     });
     
-    // Handle the largest video
-    handleVideoElement(sortedVideos[0]);
+    // Handle all videos and attach event listeners
+    sortedVideos.forEach(handleVideoElement);
+    
+    // Update our list of playing videos
+    updatePlayingVideosList();
   }
 }
 
@@ -129,21 +185,20 @@ function handleVideoElement(video) {
   // Skip if another video is already in PiP
   if (document.pictureInPictureElement) return;
   
-  // Remove existing listeners if any
+  // Remove existing listeners if any to avoid duplicates
   video.removeEventListener('play', onVideoPlay);
+  video.removeEventListener('pause', onVideoPause);
   
   // Add event listeners to the video
   video.addEventListener('play', onVideoPlay);
+  video.addEventListener('pause', onVideoPause);
   
-  // If the video is already playing, activate PiP
+  // If the video is already playing, update our tracking
   if (!video.paused && !video.ended && video.currentTime > 0) {
-    activatePictureInPicture(video);
-  }
-  
-  // Store reference to this video if it's playing and larger than current reference
-  if (!pipVideo || 
-      (video.offsetWidth * video.offsetHeight > pipVideo.offsetWidth * pipVideo.offsetHeight)) {
-    if (!video.paused && !video.ended && video.currentTime > 0) {
+    // If this is the largest playing video, make it our primary reference
+    if (!pipVideo || 
+        (video.offsetWidth * video.offsetHeight > 
+         pipVideo.offsetWidth * pipVideo.offsetHeight)) {
       pipVideo = video;
     }
   }
@@ -156,11 +211,22 @@ function onVideoPlay() {
   // Don't activate PiP if the video is already in fullscreen
   if (document.fullscreenElement) return;
   
-  // Only activate PiP if the video is actually playing
+  // Only update our reference if the video is actually playing
   if (!video.paused && !video.ended && video.currentTime > 0) {
-    activatePictureInPicture(video);
-    pipVideo = video;
+    // Update our list of playing videos
+    updatePlayingVideosList();
+    
+    // If we're in a hidden tab, activate PiP
+    if (document.hidden) {
+      activatePictureInPicture(video);
+    }
   }
+}
+
+// Function to handle video pause event
+function onVideoPause() {
+  // Update our list of playing videos
+  updatePlayingVideosList();
 }
 
 // Activate PiP for a video
@@ -171,13 +237,25 @@ async function activatePictureInPicture(video) {
   // Skip if already in PiP mode
   if (document.pictureInPictureElement === video) return;
   
+  // Skip videos that aren't ready
+  if (video.readyState < 2) return;
+  
   try {
     await video.requestPictureInPicture();
     pipVideo = video;
     
     // Add event listener for when PiP is closed
     video.addEventListener('leavepictureinpicture', () => {
-      pipVideo = null;
+      // If the document is still hidden, try to find another video to put in PiP
+      if (document.hidden && lastKnownPlayingVideos.length > 0) {
+        // Find the next best video that isn't this one
+        const nextVideo = lastKnownPlayingVideos.find(v => v !== video);
+        if (nextVideo) {
+          activatePictureInPicture(nextVideo);
+        }
+      } else {
+        pipVideo = null;
+      }
     }, { once: true });
   } catch (error) {
     console.error('Failed to enter Picture-in-Picture mode:', error);
@@ -186,10 +264,19 @@ async function activatePictureInPicture(video) {
 
 // Handle visibility changes (tab switching, etc.)
 function handleVisibilityChange() {
-  if (document.hidden && pipVideo && !document.pictureInPictureElement) {
-    // If tab becomes hidden and we have a designated PiP video that's not in PiP,
-    // try to activate PiP
-    activatePictureInPicture(pipVideo);
+  // When tab becomes hidden
+  if (document.hidden) {
+    // Update our list of playing videos first
+    updatePlayingVideosList();
+    
+    // If we have a primary video or any playing videos
+    if (pipVideo && !pipVideo.paused && !pipVideo.ended) {
+      // Try to activate PiP
+      activatePictureInPicture(pipVideo);
+    } else if (lastKnownPlayingVideos.length > 0) {
+      // If our primary reference isn't playing, use the first playing video
+      activatePictureInPicture(lastKnownPlayingVideos[0]);
+    }
   }
 }
 
@@ -199,17 +286,26 @@ function togglePictureInPicture() {
     document.exitPictureInPicture();
     pipVideo = null;
   } else {
-    const videos = document.querySelectorAll('video');
-    if (videos.length > 0) {
-      // Sort videos by dimensions to find the primary/largest one
-      const sortedVideos = Array.from(videos).sort((a, b) => {
-        const aArea = a.offsetWidth * a.offsetHeight;
-        const bArea = b.offsetWidth * b.offsetHeight;
-        return bArea - aArea; // Sort from largest to smallest
-      });
-      
-      // Activate PiP for the largest video
-      activatePictureInPicture(sortedVideos[0]);
+    // Update our list of videos first
+    updatePlayingVideosList();
+    
+    if (lastKnownPlayingVideos.length > 0) {
+      // Use the first playing video
+      activatePictureInPicture(lastKnownPlayingVideos[0]);
+    } else {
+      // If no playing videos, check for any videos
+      const videos = document.querySelectorAll('video');
+      if (videos.length > 0) {
+        // Sort videos by dimensions to find the primary/largest one
+        const sortedVideos = Array.from(videos).sort((a, b) => {
+          const aArea = a.offsetWidth * a.offsetHeight;
+          const bArea = b.offsetWidth * b.offsetHeight;
+          return bArea - aArea; // Sort from largest to smallest
+        });
+        
+        // Activate PiP for the largest video
+        activatePictureInPicture(sortedVideos[0]);
+      }
     }
   }
 }
@@ -228,6 +324,11 @@ function handleIframes() {
       // If we can access it, check for videos
       const videos = iframeDocument.querySelectorAll('video');
       videos.forEach(handleVideoElement);
+      
+      // Update our tracking after handling iframe videos
+      if (videos.length > 0) {
+        updatePlayingVideosList();
+      }
     } catch (error) {
       // CORS restrictions prevent access to iframe content
       // We can't do much here due to security restrictions
@@ -235,27 +336,54 @@ function handleIframes() {
   });
 }
 
-// Special handling for YouTube
-function handleYouTubeSpecifics() {
-  // Check if we're on YouTube
+// Special handling for YouTube and other sites
+function handleSpecificSites() {
+  // YouTube specific handling
   if (window.location.hostname.includes('youtube.com')) {
-    // YouTube uses HTML5 video player but sometimes it can be tricky to detect
-    // Force check a bit later to ensure the player has fully loaded
-    setTimeout(() => {
+    // YouTube sometimes loads videos dynamically or replaces them
+    // Set up a more aggressive check for the main player
+    const checkYouTubePlayer = () => {
       const videos = document.querySelectorAll('video');
-      if (videos.length > 0) {
-        const mainVideo = videos[0]; // Usually the main player is the first video element
-        handleVideoElement(mainVideo);
-      }
-    }, 2000);
+      videos.forEach(handleVideoElement);
+      updatePlayingVideosList();
+    };
+    
+    // Check more frequently for the first minute
+    const checkInterval = setInterval(checkYouTubePlayer, 1000);
+    setTimeout(() => clearInterval(checkInterval), 60000);
+    
+    // Also check when player controls are used
+    document.addEventListener('click', (e) => {
+      // Wait a bit for the video state to update after clicking controls
+      setTimeout(updatePlayingVideosList, 500);
+    });
   }
+}
+
+// Create a heartbeat to ensure PiP stays active when tab is hidden
+function startPipHeartbeat() {
+  // Regularly check if we should be in PiP mode when the tab is hidden
+  setInterval(() => {
+    if (document.hidden && settings.autoPipEnabled) {
+      // Update our tracking
+      updatePlayingVideosList();
+      
+      // If we have playing videos but none are in PiP, activate for the primary one
+      if (lastKnownPlayingVideos.length > 0 && !document.pictureInPictureElement) {
+        activatePictureInPicture(lastKnownPlayingVideos[0]);
+      }
+    }
+  }, 1000); // Check every second
 }
 
 // Initialize the extension
 init();
 
-// Add YouTube-specific handling
-handleYouTubeSpecifics();
+// Run site-specific handling
+handleSpecificSites();
+
+// Start the PiP heartbeat
+startPipHeartbeat();
 
 // Set up a periodic check for videos and PiP status
 // This helps catch any videos that were missed by the observer
@@ -266,10 +394,5 @@ setInterval(() => {
       checkExistingVideos();
       handleIframes();
     }
-    
-    // When tab is hidden and we have a video, make sure it's in PiP
-    if (document.hidden && pipVideo && !document.pictureInPictureElement) {
-      activatePictureInPicture(pipVideo);
-    }
   }
-}, 5000); 
+}, 3000); 
